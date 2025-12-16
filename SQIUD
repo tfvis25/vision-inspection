@@ -1,0 +1,698 @@
+import os
+import time
+import cv2
+import threading
+import requests
+import traceback
+import numpy as np
+import pandas as pd
+import joblib
+import pickle
+
+from flask import Flask, Response, render_template_string
+from dotenv import load_dotenv
+
+import inference
+import supervision as sv
+from influxdb_client import InfluxDBClient, Point, WriteOptions
+
+
+# =========================
+# Load environment variables
+# =========================
+load_dotenv()
+
+INFLUXDB_URL = os.getenv("INFLUXDB_URL")
+INFLUXDB_TOKEN = os.getenv("INFLUXDB_TOKEN")
+INFLUXDB_ORG = os.getenv("INFLUXDB_ORG")
+INFLUXDB_BUCKET = os.getenv("INFLUXDB_BUCKET")
+
+ESP32_URL = os.getenv("ESP32_URL")
+
+API_KEY = os.getenv("ROBOFLOW_API_KEY")
+model_id = os.getenv("ROBOFLOW_MODEL_ID")
+
+# Path to camera calibration file
+CALIB_FILE = os.getenv("CALIB_FILE", "Calibration.pkl")
+
+
+# =========================
+# Safety checks
+# =========================
+if not INFLUXDB_ORG or not INFLUXDB_BUCKET:
+    raise ValueError("❌ Please check your .env file. Organization or Bucket name is missing or incorrect.")
+
+
+# =========================
+# Flask + shared frame buffer
+# =========================
+app = Flask(__name__)
+output_frame = None
+lock = threading.Lock()
+
+
+# =========================
+# InfluxDB setup
+# =========================
+influx_client = InfluxDBClient(url=INFLUXDB_URL, token=INFLUXDB_TOKEN, org=INFLUXDB_ORG)
+write_api = influx_client.write_api(write_options=WriteOptions(batch_size=1))
+
+
+def upload_to_influxdb(alu_w, alu_h, alu_status,
+                       hole_d, hole_status,
+                       slot_w, slot_h, slot_status,
+                       status1, tag1, action1,
+                       status2, tag2, action2,
+                       status3, tag3, action3):
+    try:
+        point = (
+            Point("measurment")
+            .field("alu_width", round(float(alu_w or 0), 2))
+            .field("alu_height", round(float(alu_h or 0), 2))
+            .field("alu_status", 1 if str(alu_status).upper() == "PASS" else 0)
+            .field("hole_diameter", round(float(hole_d or 0), 2))
+            .field("hole_status", 1 if str(hole_status).upper() == "PASS" else 0)
+            .field("slot_width", round(float(slot_w or 0), 2))
+            .field("slot_height", round(float(slot_h or 0), 2))
+            .field("slot_status", 1 if str(slot_status).upper() == "PASS" else 0)
+            .field("ml_status_p1", 1 if status1 == "Pass" else 0)
+            .field("inventory_tag_p1", str(tag1))
+            .field("suggested_action_p1", str(action1))
+            .field("ml_status_p2", 1 if status2 == "Pass" else 0)
+            .field("inventory_tag_p2", str(tag2))
+            .field("suggested_action_p2", str(action2))
+            .field("ml_status_p3", 1 if status3 == "Pass" else 0)
+            .field("inventory_tag_p3", str(tag3))
+            .field("suggested_action_p3", str(action3))
+        )
+        write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=point)
+        print("✅ Uploaded to InfluxDB")
+    except Exception as e:
+        print("❌ Upload error:", e)
+        traceback.print_exc()
+
+
+# =========================
+# Roboflow model load
+# =========================
+try:
+    model = inference.get_model(model_id, API_KEY)
+    print("✅ Roboflow model loaded.")
+except Exception as e:
+    print("❌ Failed to load Roboflow model:", e)
+    raise SystemExit(1)
+
+box_annotator = sv.BoxAnnotator()
+
+
+# =========================
+# Tolerances
+# =========================
+tolerances = {
+    "Alu_part": {"width": 80.0, "height": 36.0, "tol": 1},
+    "Hole": {"diameter": 21.0, "tol": 0.5},
+    "slot": {"width": 31.0, "height": 21.0, "tol": 0.75},
+}
+
+
+# =========================
+# Load camera calibration (K, D)
+# =========================
+camera_matrix = None
+dist_coeffs = None
+new_camera_matrix = None
+calib_roi = None
+
+def load_calibration(calib_path: str):
+    """
+    Supports common pickle formats:
+      - dict with keys: 'camera_matrix'/'mtx'/'K' and 'dist_coeffs'/'dist'/'D'
+      - tuple/list: (K, D) or (K, D, rvecs, tvecs) etc.
+    """
+    if not os.path.exists(calib_path):
+        print(f"⚠️ Calibration file not found: {calib_path} (running WITHOUT undistortion)")
+        return None, None
+
+    try:
+        with open(calib_path, "rb") as f:
+            data = pickle.load(f)
+
+        K = D = None
+
+        if isinstance(data, dict):
+            # try common key names
+            for kkey in ("camera_matrix", "mtx", "K", "intrinsic_matrix", "intrinsics"):
+                if kkey in data:
+                    K = np.array(data[kkey], dtype=np.float64)
+                    break
+            for dkey in ("dist_coeffs", "dist", "D", "distortion", "distCoeffs"):
+                if dkey in data:
+                    D = np.array(data[dkey], dtype=np.float64)
+                    break
+
+        elif isinstance(data, (list, tuple)) and len(data) >= 2:
+            K = np.array(data[0], dtype=np.float64)
+            D = np.array(data[1], dtype=np.float64)
+
+        if K is None or D is None:
+            print("⚠️ Calibration.pkl loaded but could not find camera_matrix/dist_coeffs. (running WITHOUT undistortion)")
+            return None, None
+
+        # sanity: camera matrix must be 3x3
+        if K.shape != (3, 3):
+            print(f"⚠️ Invalid camera matrix shape: {K.shape}. (running WITHOUT undistortion)")
+            return None, None
+
+        D = D.reshape(-1, 1) if D.ndim == 1 else D
+        print("✅ Calibration loaded (fx, fy, cx, cy) and distortion coefficients.")
+        return K, D
+
+    except Exception as e:
+        print(f"⚠️ Failed to load calibration file: {e} (running WITHOUT undistortion)")
+        traceback.print_exc()
+        return None, None
+
+
+camera_matrix, dist_coeffs = load_calibration(CALIB_FILE)
+
+
+def undistort_frame(frame):
+    """
+    Undistort using loaded calibration.
+    Also updates optimal new camera matrix based on frame size (once).
+    """
+    global new_camera_matrix, calib_roi
+
+    if camera_matrix is None or dist_coeffs is None:
+        return frame
+
+    h, w = frame.shape[:2]
+    if new_camera_matrix is None:
+        # alpha=0 crops more, alpha=1 keeps all pixels (black borders).
+        new_camera_matrix, calib_roi = cv2.getOptimalNewCameraMatrix(
+            camera_matrix, dist_coeffs, (w, h), alpha=0.8, newImgSize=(w, h)
+        )
+
+    und = cv2.undistort(frame, camera_matrix, dist_coeffs, None, new_camera_matrix)
+
+    # Optional crop to valid ROI (recommended to avoid black borders)
+    if calib_roi is not None:
+        x, y, rw, rh = calib_roi
+        if rw > 0 and rh > 0:
+            und = und[y:y+rh, x:x+rw]
+            # resize back so your detection window remains stable (optional)
+            und = cv2.resize(und, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    return und
+
+
+# =========================
+# ML model loading helpers
+# =========================
+def safe_load(path, descr="model"):
+    try:
+        return joblib.load(path)
+    except FileNotFoundError:
+        print(f"❌ {descr} file not found: {path}")
+        raise
+    except Exception as e:
+        print(f"❌ Error loading {descr} from {path}: {e}")
+        traceback.print_exc()
+        raise
+
+
+# =========================
+# Load Process 1 ML Models
+# =========================
+BASE_DIR_1 = r"C:\Users\Program Files \Process 1"
+MODEL_FILE_1 = os.path.join(BASE_DIR_1, "part_classifier.pkl")
+ENCODER_FILE_1 = os.path.join(BASE_DIR_1, "label_encoder.pkl")
+ACTION_MODEL_FILE_1 = os.path.join(BASE_DIR_1, "action_classifier.pkl")
+ACTION_ENCODER_FILE_1 = os.path.join(BASE_DIR_1, "action_label_encoder.pkl")
+
+tag_model_1 = safe_load(MODEL_FILE_1, "Process1 tag model")
+tag_encoder_1 = safe_load(ENCODER_FILE_1, "Process1 label encoder")
+action_model_1 = safe_load(ACTION_MODEL_FILE_1, "Process1 action model")
+action_encoder_1 = safe_load(ACTION_ENCODER_FILE_1, "Process1 action encoder")
+
+
+def predict_part_1(length, width):
+    try:
+        spindle_speed = 6000
+        feed_rate = 180
+        depth_of_cut = 1.2
+        features = pd.DataFrame(
+            [[length, width, spindle_speed, feed_rate, depth_of_cut]],
+            columns=["Length", "Width", "Spindle_Speed", "Feed_Rate", "Depth_of_Cut"]
+        )
+        tag = tag_encoder_1.inverse_transform(tag_model_1.predict(features))[0]
+        action = action_encoder_1.inverse_transform(action_model_1.predict(features))[0]
+        status = "Pass" if tag == "Pass" else "Fail"
+        return status, tag, action
+    except Exception as e:
+        print("❌ predict_part_1 error:", e)
+        traceback.print_exc()
+        return "Fail", "Unknown", "No action"
+
+
+# =========================
+# Load Process 2 ML Models
+# =========================
+BASE_DIR_2 = r"C:\Users\Program Files \Process 2"
+MODEL_FILE_2 = os.path.join(BASE_DIR_2, "part_classifier.pkl")
+ENCODER_FILE_2 = os.path.join(BASE_DIR_2, "label_encoder.pkl")
+ACTION_MODEL_FILE_2 = os.path.join(BASE_DIR_2, "action_classifier.pkl")
+ACTION_ENCODER_FILE_2 = os.path.join(BASE_DIR_2, "action_label_encoder.pkl")
+
+tag_model_2 = safe_load(MODEL_FILE_2, "Process2 tag model")
+tag_encoder_2 = safe_load(ENCODER_FILE_2, "Process2 label encoder")
+action_model_2 = safe_load(ACTION_MODEL_FILE_2, "Process2 action model")
+action_encoder_2 = safe_load(ACTION_ENCODER_FILE_2, "Process2 action encoder")
+
+
+def predict_part_2(dia):
+    try:
+        spindle_speed = 4500
+        feed_rate = 150
+        depth_of_cut = 0.8
+        features = pd.DataFrame(
+            [[spindle_speed, feed_rate, depth_of_cut, dia]],
+            columns=["Spindle_Speed", "Feed_Rate", "Depth_of_Cut", "Dia"]
+        )
+        tag = tag_encoder_2.inverse_transform(tag_model_2.predict(features))[0]
+        action = action_encoder_2.inverse_transform(action_model_2.predict(features))[0]
+        status = "Pass" if tag == "Pass" else "Fail"
+        return status, tag, action
+    except Exception as e:
+        print("❌ predict_part_2 error:", e)
+        traceback.print_exc()
+        return "Fail", "Unknown", "No action"
+
+
+# =========================
+# Load Process 3 ML Models
+# =========================
+BASE_DIR_3 = r"C:\Users\Program Files \Process 3"
+MODEL_FILE_3 = os.path.join(BASE_DIR_3, "part_classifier.pkl")
+ENCODER_FILE_3 = os.path.join(BASE_DIR_3, "label_encoder.pkl")
+ACTION_MODEL_FILE_3 = os.path.join(BASE_DIR_3, "action_classifier.pkl")
+ACTION_ENCODER_FILE_3 = os.path.join(BASE_DIR_3, "action_label_encoder.pkl")
+
+tag_model_3 = safe_load(MODEL_FILE_3, "Process3 tag model")
+tag_encoder_3 = safe_load(ENCODER_FILE_3, "Process3 label encoder")
+action_model_3 = safe_load(ACTION_MODEL_FILE_3, "Process3 action model")
+action_encoder_3 = safe_load(ACTION_ENCODER_FILE_3, "Process3 action encoder")
+
+
+def predict_part_3(slot_length, slot_width):
+    try:
+        spindle_speed = 7000
+        feed_rate = 222
+        depth_of_cut = 0.99
+        features = pd.DataFrame(
+            [[slot_length, slot_width, spindle_speed, feed_rate, depth_of_cut]],
+            columns=["Slot_Length", "Slot_Width", "Spindle_Speed", "Feed_Rate", "Depth_of_Cut"]
+        )
+        tag = tag_encoder_3.inverse_transform(tag_model_3.predict(features))[0]
+        action = action_encoder_3.inverse_transform(action_model_3.predict(features))[0]
+        status = "Pass" if tag == "Pass" else "Fail"
+        return status, tag, action
+    except Exception as e:
+        print("❌ predict_part_3 error:", e)
+        traceback.print_exc()
+        return "Fail", "Unknown", "No action"
+
+
+# =========================
+# Camera grabbing
+# =========================
+use_cv_capture = True
+cap = None
+try:
+    cap = cv2.VideoCapture(ESP32_URL)
+    time.sleep(0.5)
+    if not cap.isOpened():
+        print(f"⚠️ cv2.VideoCapture could not open {ESP32_URL}. Fallback to HTTP snapshot reads.")
+        use_cv_capture = False
+        cap.release()
+        cap = None
+    else:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        print(f"✅ cv2.VideoCapture opened {ESP32_URL}")
+except Exception as e:
+    print("⚠️ Error opening capture via cv2:", e)
+    use_cv_capture = False
+    if cap:
+        cap.release()
+        cap = None
+
+
+def get_frame_from_http_snapshot():
+    try:
+        resp = requests.get(ESP32_URL, timeout=5)
+        if resp.status_code == 200:
+            arr = np.asarray(bytearray(resp.content), dtype=np.uint8)
+            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            return frame
+        print(f"⚠️ HTTP snapshot returned {resp.status_code}")
+        return None
+    except Exception as e:
+        print("⚠️ HTTP snapshot fetch error:", e)
+        return None
+
+
+def read_frame():
+    if use_cv_capture and cap:
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            frame = get_frame_from_http_snapshot()
+    else:
+        frame = get_frame_from_http_snapshot()
+
+    if frame is None:
+        return None
+
+    # ✅ Always undistort first
+    frame = undistort_frame(frame)
+    return frame
+
+
+# =========================
+# Calibration (pixels_per_mm)
+# =========================
+def calibrate_pixels_to_mm(frame, known_width_mm):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edged = cv2.Canny(blurred, 50, 150)
+    contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours:
+        return None
+
+    largest_contour = max(contours, key=cv2.contourArea)
+    x, y, w, h = cv2.boundingRect(largest_contour)
+    if w <= 0:
+        return None
+
+    return w / float(known_width_mm)
+
+
+# =========================
+# Contours + matching helpers
+# =========================
+def contour_features(contour):
+    area = cv2.contourArea(contour)
+    peri = cv2.arcLength(contour, True)
+    circularity = 0.0
+    if peri > 1e-6:
+        circularity = 4.0 * np.pi * area / (peri * peri)
+    rect = cv2.minAreaRect(contour)
+    (cx, cy), (rw, rh), angle = rect
+    return {"area": area, "circularity": circularity, "minrect": rect, "w_px": rw, "h_px": rh}
+
+
+def bbox_iou(a, b):
+    xA = max(a[0], b[0]); yA = max(a[1], b[1])
+    xB = min(a[2], b[2]); yB = min(a[3], b[3])
+    interW = max(0, xB - xA); interH = max(0, yB - yA)
+    interArea = interW * interH
+    if interArea <= 0:
+        return 0.0
+    boxAArea = max(0, a[2]-a[0]) * max(0, a[3]-a[1])
+    boxBArea = max(0, b[2]-b[0]) * max(0, b[3]-b[1])
+    denom = boxAArea + boxBArea - interArea
+    return interArea / denom if denom > 0 else 0.0
+
+
+def find_contours_fullframe(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, thresh = cv2.threshold(blurred, 100, 255, cv2.THRESH_BINARY_INV)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    return [c for c in contours if cv2.contourArea(c) >= 300]
+
+
+def match_contours_to_detections(contours, det_boxes, min_iou=0.10):
+    det_to_best = {i: None for i in range(len(det_boxes))}
+    det_to_best_score = {i: 0.0 for i in range(len(det_boxes))}
+    for c in contours:
+        x, y, w, h = cv2.boundingRect(c)
+        cbox = (x, y, x+w, y+h)
+        for i, dbox in enumerate(det_boxes):
+            score = bbox_iou(cbox, dbox)
+            if score >= min_iou and score > det_to_best_score[i]:
+                det_to_best_score[i] = score
+                det_to_best[i] = c
+    return det_to_best
+
+
+# =========================
+# Main pipeline
+# =========================
+pixels_per_mm = None
+calibrated = False
+last_upload_time = 0
+upload_interval = 30
+
+
+def process_frames():
+    global output_frame, pixels_per_mm, calibrated, last_upload_time
+
+    print("🚀 Starting camera preview.")
+    print("Press 'c' to calibrate (enter reference width in mm). Press 'q' to quit.")
+
+    # --- Calibration loop ---
+    while not calibrated:
+        frame = read_frame()
+        if frame is None:
+            print("❌ Camera read failed. Retrying in 1s...")
+            time.sleep(1)
+            continue
+
+        cv2.imshow("Calibration Preview (Undistorted) - Press 'c'", frame)
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord('c'):
+            try:
+                ref_w = float(input("📐 Enter reference object width in mm: "))
+                ppm = calibrate_pixels_to_mm(frame, ref_w)
+                if ppm is None:
+                    print("❌ Calibration failed: reference contour not detected. Try again.")
+                    continue
+                pixels_per_mm = ppm
+                calibrated = True
+                print(f"✅ Calibration done: {pixels_per_mm:.2f} pixels/mm")
+            except ValueError:
+                print("❌ Invalid input. Please enter numeric value.")
+        elif key == ord('q'):
+            print("👋 Quit during calibration.")
+            if cap:
+                cap.release()
+            cv2.destroyAllWindows()
+            return
+
+    cv2.destroyWindow("Calibration Preview (Undistorted) - Press 'c'")
+    print("✅ Starting real-time detection + contour measurement (undistorted frames)...")
+
+    while True:
+        frame = read_frame()
+        if frame is None:
+            print("❌ Camera read failed. Retrying in 1s...")
+            time.sleep(1)
+            continue
+
+        # Detection
+        try:
+            results = model.infer(frame, confidence=0.4, overlap=30)[0]
+            detections = sv.Detections.from_inference(results)
+        except Exception as e:
+            print("⚠️ Inference error:", e)
+            traceback.print_exc()
+            with lock:
+                output_frame = frame.copy()
+            time.sleep(0.01)
+            continue
+
+        xyxy = getattr(detections, "xyxy", None)
+        if xyxy is None or len(xyxy) == 0:
+            with lock:
+                output_frame = frame.copy()
+            cv2.imshow("Final Output (Undistorted) - q to quit", frame)
+            if (cv2.waitKey(1) & 0xFF) == ord('q'):
+                break
+            continue
+
+        # class names
+        if "class_name" in detections.data and len(detections.data["class_name"]) == len(xyxy):
+            class_names = list(detections.data["class_name"])
+        else:
+            try:
+                class_names = [str(cid) for cid in detections.class_id]
+            except Exception:
+                class_names = [f"class_{i}" for i in range(len(xyxy))]
+            detections.data["class_name"] = class_names
+
+        det_boxes = [tuple(map(int, b)) for b in xyxy]
+
+        # Contours full-frame (undistorted)
+        contours = find_contours_fullframe(frame)
+        det_to_contour = match_contours_to_detections(contours, det_boxes, min_iou=0.10)
+
+        # defaults
+        alu_w = alu_h = None
+        hole_d = None
+        slot_w = slot_h = None
+        alu_status = hole_status = slot_status = "FAIL"
+
+        status1, tag1, action1 = "Fail", "Unknown", "No action"
+        status2, tag2, action2 = "Fail", "Unknown", "No action"
+        status3, tag3, action3 = "Fail", "Unknown", "No action"
+
+        annotated = box_annotator.annotate(scene=frame.copy(), detections=detections)
+
+        for i, dbox in enumerate(det_boxes):
+            class_name = class_names[i]
+            x1, y1, x2, y2 = dbox
+            matched_c = det_to_contour.get(i)
+
+            width_px = max(0, x2 - x1)
+            height_px = max(0, y2 - y1)
+
+            if matched_c is not None:
+                feat = contour_features(matched_c)
+                w_px = max(feat["w_px"], feat["h_px"])
+                h_px = min(feat["w_px"], feat["h_px"])
+                circularity = feat["circularity"]
+            else:
+                w_px, h_px = float(width_px), float(height_px)
+                circularity = 0.0
+
+            w_mm = w_px / pixels_per_mm if pixels_per_mm else 0.0
+            h_mm = h_px / pixels_per_mm if pixels_per_mm else 0.0
+
+            tol = tolerances.get(class_name)
+
+            if tol:
+                if class_name == "Hole":
+                    if matched_c is not None and pixels_per_mm:
+                        (cx, cy), radius = cv2.minEnclosingCircle(matched_c)
+                        diameter_mm = (2.0 * radius) / pixels_per_mm
+                    else:
+                        diameter_mm = (w_mm + h_mm) / 2.0
+
+                    status = "PASS" if abs(diameter_mm - tol["diameter"]) <= tol["tol"] else "FAIL"
+                    size_text = f"D={diameter_mm:.2f}mm"
+                    hole_d, hole_status = diameter_mm, status
+
+                else:
+                    status = "PASS" if (
+                        abs(w_mm - tol["width"]) <= tol["tol"] and
+                        abs(h_mm - tol["height"]) <= tol["tol"]
+                    ) else "FAIL"
+                    size_text = f"{w_mm:.1f}mm x {h_mm:.1f}mm"
+
+                    if class_name == "Alu_part":
+                        alu_w, alu_h, alu_status = w_mm, h_mm, status
+                    elif class_name == "slot":
+                        slot_w, slot_h, slot_status = w_mm, h_mm, status
+            else:
+                status = "FAIL"
+                size_text = f"{w_mm:.1f}mm x {h_mm:.1f}mm"
+
+            if matched_c is not None:
+                cv2.drawContours(annotated, [matched_c], -1, (255, 255, 0), 2)
+
+            label = f"{class_name}: {size_text} {status}"
+            text_color = (0, 255, 0) if status == "PASS" else (0, 0, 255)
+            text_y = max(y1 - 10, 15)
+            cv2.putText(annotated, label, (x1, text_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 2)
+
+        # ML calls
+        if alu_w is not None and alu_h is not None:
+            status1, tag1, action1 = predict_part_1(alu_w, alu_h)
+        if hole_d is not None:
+            status2, tag2, action2 = predict_part_2(hole_d)
+        if slot_w is not None and slot_h is not None:
+            status3, tag3, action3 = predict_part_3(slot_w, slot_h)
+
+        # Upload
+        if time.time() - last_upload_time >= upload_interval:
+            print("⏳ Uploading to InfluxDB...")
+            upload_to_influxdb(
+                alu_w, alu_h, alu_status,
+                hole_d, hole_status,
+                slot_w, slot_h, slot_status,
+                status1, tag1, action1,
+                status2, tag2, action2,
+                status3, tag3, action3
+            )
+            last_upload_time = time.time()
+
+        with lock:
+            output_frame = annotated.copy()
+
+        cv2.imshow("Final Output (Undistorted) - q to quit", annotated)
+        if (cv2.waitKey(1) & 0xFF) == ord('q'):
+            print("👋 Quit detected.")
+            break
+
+    if cap:
+        cap.release()
+    cv2.destroyAllWindows()
+
+
+# =========================
+# Flask streaming
+# =========================
+def generate_frames():
+    global output_frame
+    while True:
+        with lock:
+            if output_frame is None:
+                time.sleep(0.01)
+                continue
+            ok, buffer = cv2.imencode(".jpg", output_frame)
+            if not ok:
+                continue
+            frame_bytes = buffer.tobytes()
+
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+
+
+@app.route('/')
+def index():
+    return render_template_string("""
+        <html>
+            <head><title>Live Measurement View</title></head>
+            <body>
+                <h1>Live Measurement + Detection Stream (Undistorted)</h1>
+                <img src="/video_feed" width="800" />
+                <p>Calibration happens in OpenCV window. Press 'c' to calibrate, 'q' to quit.</p>
+            </body>
+        </html>
+    """)
+
+
+@app.route('/video_feed')
+def video_feed():
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+# =========================
+# Run
+# =========================
+if __name__ == "__main__":
+    t = threading.Thread(target=process_frames, daemon=True)
+    t.start()
+
+    try:
+        app.run(host="0.0.0.0", port=5000, debug=False)
+    except KeyboardInterrupt:
+        print("Exiting...")
+    finally:
+        if cap:
+            cap.release()
+        cv2.destroyAllWindows()
