@@ -1,0 +1,90 @@
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import classification_report, confusion_matrix
+import joblib
+import os
+
+# ========================================
+# CONFIG
+# ========================================
+EXCEL_FILE = r"C:\Users\Process\Step Data Set.xlsx"
+SHEET_NAME = "Step 1"
+
+BASE_DIR = os.path.dirname(EXCEL_FILE)
+MODEL_FILE = os.path.join(BASE_DIR, "part_classifier.pkl")
+ACTION_MODEL_FILE = os.path.join(BASE_DIR, "action_classifier.pkl")
+ENCODER_FILE = os.path.join(BASE_DIR, "label_encoder.pkl")
+ACTION_ENCODER_FILE = os.path.join(BASE_DIR, "action_label_encoder.pkl")
+
+# ========================================
+# LOAD DATA
+# ========================================
+df = pd.read_excel(EXCEL_FILE, sheet_name=SHEET_NAME)
+
+# Normalize column names to avoid spaces/underscores issues
+df.columns = [c.strip().replace(" ", "_") for c in df.columns]
+print("Columns found in file:", df.columns.tolist())
+
+# ========================================
+# FEATURES & TARGETS
+# ========================================
+features = ["Length", "Width", "Spindle_Speed", "Feed_Rate", "Depth_of_Cut"]
+
+# Ensure these columns exist
+missing = [col for col in features if col not in df.columns]
+if missing:
+    raise ValueError(f"Missing feature columns in dataset: {missing}")
+
+# Targets
+if "Inventory_Tag" not in df.columns:
+    raise ValueError("Column 'Inventory Tag' or 'Inventory_Tag' not found.")
+if "Suggestive_Action" not in df.columns:
+    raise ValueError("Column 'Suggestive_Action' not found.")
+
+X = df[features]
+y_tag = df["Inventory_Tag"]
+y_action = df["Suggestive_Action"]
+
+# ========================================
+# ENCODERS
+# ========================================
+tag_encoder = LabelEncoder()
+y_tag_encoded = tag_encoder.fit_transform(y_tag)
+
+action_encoder = LabelEncoder()
+y_action_encoded = action_encoder.fit_transform(y_action)
+
+# ========================================
+# TRAIN INVENTORY TAG MODEL
+# ========================================
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y_tag_encoded, test_size=0.2, random_state=42
+)
+
+tag_model = RandomForestClassifier(n_estimators=100, random_state=42)
+tag_model.fit(X_train, y_train)
+
+# Evaluate
+print("\nInventory Tag Classification Report:\n")
+y_pred = tag_model.predict(X_test)
+print(classification_report(y_test, y_pred, target_names=tag_encoder.classes_))
+print("Confusion Matrix:\n", confusion_matrix(y_test, y_pred))
+
+# ========================================
+# TRAIN SUGGESTIVE ACTION MODEL
+# ========================================
+action_model = RandomForestClassifier(n_estimators=100, random_state=42)
+action_model.fit(X, y_action_encoded)
+
+# ========================================
+# SAVE MODELS AND ENCODERS
+# ========================================
+joblib.dump(tag_model, MODEL_FILE)
+joblib.dump(tag_encoder, ENCODER_FILE)
+joblib.dump(action_model, ACTION_MODEL_FILE)
+joblib.dump(action_encoder, ACTION_ENCODER_FILE)
+
+print(f"\nModels saved to {BASE_DIR}")
+# ========================================
